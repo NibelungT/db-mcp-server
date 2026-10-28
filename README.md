@@ -1,4 +1,4 @@
-# db-mcp-service
+# db-mcp-server
 
 给 AI 用的多数据源 MySQL 查询服务，带一个网页配置中心。
 
