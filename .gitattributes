@@ -1,0 +1,11 @@
+# 统一换行，避免不同平台 clone 后脚本失效
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF，否则 goto 标签可能解析失败
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 这些是二进制/不该被换行转换处理
+*.png binary
+*.jpg binary
+*.ico binary

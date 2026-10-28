@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "environments": [
+    { "key": "dev", "label": "开发", "order": 1, "readonlyHint": false },
+    { "key": "test", "label": "测试", "order": 2, "readonlyHint": false },
+    { "key": "prod", "label": "生产", "order": 3, "readonlyHint": true }
+  ],
+  "global": {
+    "defaultDatasource": null,
+    "defaultProject": null,
+    "defaultEnv": null
+  },
+  "datasources": [
+    {
+      "id": "ds_example_order_test",
+      "alias": "order-test",
+      "env": "test",
+      "driver": "mysql",
+      "host": "10.0.0.1",
+      "port": 3306,
+      "user": "readonly_user",
+      "password": "${ORDER_TEST_PASSWORD}",
+      "database": "myapp_order",
+      "params": { "charset": "utf8mb4" },
+      "readonly": false,
+      "description": "示例：密码用环境变量引用，也可直接写明文"
+    },
+    {
+      "id": "ds_example_order_prod",
+      "alias": "order-prod",
+      "env": "prod",
+      "driver": "mysql",
+      "host": "10.0.0.2",
+      "port": 3306,
+      "user": "readonly_user",
+      "password": "${ORDER_PROD_PASSWORD}",
+      "database": "myapp_order",
+      "params": { "charset": "utf8mb4" },
+      "readonly": true,
+      "description": "生产库通常设为只读，execute 会被拒绝"
+    }
+  ],
+  "projects": [
+    {
+      "id": "p_example_order",
+      "name": "订单服务",
+      "aliases": ["order", "订单"],
+      "defaultEnv": "test",
+      "bindings": {
+        "test": "ds_example_order_test",
+        "prod": "ds_example_order_prod"
+      }
+    }
+  ]
+}
