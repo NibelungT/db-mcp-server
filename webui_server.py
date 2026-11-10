@@ -25,7 +25,7 @@ from config_store import (
     new_id,
     resolve_password,
 )
-from db_dialect import default_port, get_dialect, supported_drivers
+from db_dialect import default_port, explain_error, get_dialect, supported_drivers
 
 CONFIG_PATH = os.environ.get("DB_MCP_CONFIG") or os.path.join(BASE_DIR, "config.json")
 WEBUI_DIR = os.path.join(BASE_DIR, "webui")
@@ -254,7 +254,7 @@ def _try_connect(ds):
         return {
             "ok": False,
             "ms": int((time.time() - start) * 1000),
-            "error": f"{type(e).__name__}: {e}"[:300],
+            "error": f"{type(e).__name__}: {explain_error(e)}"[:600],
         }
 
 
@@ -295,7 +295,7 @@ def probe_databases(body: ProbeIn):
             "ms": int((time.time() - start) * 1000),
         }
     except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]}
+        return {"ok": False, "error": f"{type(e).__name__}: {explain_error(e)}"[:600]}
 
 
 # ------------------------------------------------------------------ 项目 CRUD

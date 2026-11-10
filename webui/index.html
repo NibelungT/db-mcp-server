@@ -1226,7 +1226,7 @@ function openDsModal(id) {
 
       <div class="field">
         <div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px">
-          <label class="label" style="margin-bottom:0">数据库名 <span class="opt">可选</span></label>
+          <label class="label" style="margin-bottom:0">数据库名 <span class="opt" id="f-db-opt">可选</span></label>
           <button class="btn tiny ghost" onclick="loadDatabases('${isEdit ? d.id : ''}')">加载库列表</button>
         </div>
         <input type="text" id="f-database" class="mono" list="db-list" value="${esc(d.database)}" placeholder="留空 = 不限定库" style="margin-top:8px">
@@ -1266,6 +1266,9 @@ function onDriverChange() {
     const isDefault = Object.values(DRIVER_PORTS).some(v => String(v) === port.value.trim());
     if (isDefault || !port.value.trim()) port.value = DRIVER_PORTS[drv] || '';
   }
+  // PG 必须连到一个已存在的库，留空会因为默认用用户名当库名而连不上
+  const db = $('f-database');
+  if (drv === 'postgres' && db && !db.value.trim()) db.value = 'postgres';
   syncDriverUI();
 }
 
@@ -1273,13 +1276,20 @@ function syncDriverUI() {
   const drvEl = $('f-driver');
   if (!drvEl) return;
   const drv = drvEl.value;
+  const isPg = drv === 'postgres';
+
   const wrap = $('f-schema-wrap');
-  if (wrap) wrap.style.display = drv === 'postgres' ? '' : 'none';
+  if (wrap) wrap.style.display = isPg ? '' : 'none';
+
+  const db = $('f-database');
+  if (db) db.placeholder = isPg ? 'postgres' : '留空 = 不限定库';
+  const dbOpt = $('f-db-opt');
+  if (dbOpt) dbOpt.textContent = isPg ? 'PG 必填，可先填 postgres 再加载列表' : '可选';
 
   const hint = $('db-hint');
   if (hint) {
-    hint.innerHTML = drv === 'postgres'
-      ? 'PG 连接绑定的是 database，「库.表」的第一段按 <code class="mono">schema</code> 解释；跨 database 查询不支持'
+    hint.innerHTML = isPg
+      ? 'PG 连接必须指定一个已存在的库，没有「不限定库」；「库.表」里的第一段是 <code class="mono">schema</code>，不是 database'
       : '留空则不绑定具体库，查询时用 <code class="mono">库名.表名</code> 跨库访问';
   }
 }

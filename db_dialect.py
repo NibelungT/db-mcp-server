@@ -221,8 +221,10 @@ class PostgresDialect(Dialect):
             password=ds.get("password") or None,
             connect_timeout=10,
         )
-        if ds.get("database"):
-            kwargs["dbname"] = ds["database"]
+        # PG 没有「不连库」的状态：库名为空时 psycopg 会把用户名当库名，
+        # 报 "database \"<用户名>\" does not exist"。退到 postgres 维护库，
+        # 连上之后再让用户「加载库列表」挑真正的库。
+        kwargs["dbname"] = ds.get("database") or "postgres"
         params = ds.get("params") or {}
         if params.get("sslmode"):
             kwargs["sslmode"] = params["sslmode"]
@@ -372,3 +374,28 @@ def is_supported(driver):
 def default_port(driver, fallback=3306):
     cls = _REGISTRY.get(normalize_driver(driver))
     return cls.default_port if cls else fallback
+
+
+def explain_error(exc):
+    """把驱动的常见报错翻译成能自我纠正的提示。
+
+    驱动原始报文只说了「哪里错了」，没说「该怎么改」；AI 拿到这种消息
+    容易反复重试同一个错误，所以在这里补一句动作指引。
+    """
+    msg = str(exc)
+    low = msg.lower()
+
+    if "does not exist" in low and "database" in low:
+        return (
+            f"{msg}\n"
+            "提示：PostgreSQL 必须连到一个已存在的库，没有「不限定库」这种状态。"
+            "库名留空时驱动会拿用户名当库名，几乎必然不存在。"
+            "先填 postgres（维护库）再点「加载库列表」挑真正的库。"
+        )
+    if "password authentication failed" in low or "access denied for user" in low:
+        return f"{msg}\n提示：账号或密码不对。编辑数据源时密码留空表示沿用旧值。"
+    if "could not connect" in low or "connection refused" in low or "connection timeout" in low:
+        return f"{msg}\n提示：网络或实例不可达，先确认主机端口是否放通、实例是否在运行。"
+    if "permission denied" in low:
+        return f"{msg}\n提示：当前账号没有该对象的权限，换库或找 DBA 授权。"
+    return msg

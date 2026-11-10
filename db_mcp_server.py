@@ -21,7 +21,7 @@ from mcp.server.stdio import stdio_server
 
 import query_log
 from config_store import BASE_DIR, ConfigError, ConfigStore, resolve_password
-from db_dialect import DialectError, get_dialect, normalize_driver
+from db_dialect import DialectError, explain_error, get_dialect, normalize_driver
 
 app = Server("db-mcp-server")
 store = ConfigStore()
@@ -276,7 +276,7 @@ async def call_tool(name: str, arguments: dict):
         return text(f"[提示] {e}")
     except Exception as e:
         log(False, error=f"{type(e).__name__}: {e}")
-        return text(f"[错误] {type(e).__name__}: {e}")
+        return text(f"[错误] {type(e).__name__}: {explain_error(e)}")
 
 
 def _query(ds, env, args):
@@ -497,8 +497,8 @@ def cli_mode():
             error=f"{type(e).__name__}: {e}"[:300],
             project=getattr(args, "project", None),
         )
-        print(json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False),
-              file=sys.stderr)
+        print(json.dumps({"error": f"{type(e).__name__}: {explain_error(e)}"},
+                         ensure_ascii=False), file=sys.stderr)
         return 1
 
 
