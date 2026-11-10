@@ -1,5 +1,6 @@
 mcp
 mysql-connector-python
+psycopg[binary]
 python-dotenv
 fastapi
 uvicorn

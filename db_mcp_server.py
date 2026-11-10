@@ -21,6 +21,7 @@ from mcp.server.stdio import stdio_server
 
 import query_log
 from config_store import BASE_DIR, ConfigError, ConfigStore, resolve_password
+from db_dialect import DialectError, get_dialect, normalize_driver
 
 app = Server("db-mcp-server")
 store = ConfigStore()
@@ -92,27 +93,26 @@ def source_label(ds, env):
             parts.append(label)
         except Exception:
             parts.append(env)
-    if ds.get("database"):
-        parts.append(ds["database"])
+    db = ds.get("database") or ""
+    schema = (ds.get("schema") or "").strip()
+    if schema and normalize_driver(ds.get("driver")) == "postgres":
+        # PG 的库名和 schema 都要露出来，否则不知道查的是哪个命名空间
+        db = f"{db}/{schema}" if db else schema
+    if db:
+        parts.append(db)
     return " · ".join(parts)
 
 
-def get_conn(ds):
-    import mysql.connector
+def open_conn(ds):
+    """按驱动的方言层建连，返回 (dialect, connection)。
 
-    kwargs = dict(
-        host=ds["host"],
-        port=int(ds.get("port", 3306)),
-        user=ds.get("user", ""),
-        password=resolve_password(ds.get("password", "")),
-        connection_timeout=10,
-    )
-    if ds.get("database"):
-        kwargs["database"] = ds["database"]
-    params = ds.get("params") or {}
-    if params.get("charset"):
-        kwargs["charset"] = params["charset"]
-    return mysql.connector.connect(**kwargs)
+    密码在这一层才解析：配置里存的可能是 ${VAR} 引用，
+    解析结果不落盘、也不进日志。
+    """
+    d = get_dialect(ds.get("driver"))
+    patched = dict(ds)
+    patched["password"] = resolve_password(ds.get("password", ""))
+    return d, d.connect(patched)
 
 
 def text(s):
@@ -164,7 +164,13 @@ async def list_tools():
         types.Tool(
             name="describe_table",
             description="查看目标库中某张表的字段结构（列名、类型、主键等）",
-            inputSchema=schema({"table": {"type": "string"}}, ["table"]),
+            inputSchema=schema(
+                {"table": {"type": "string", "description": (
+                    "表名。可写成「库名.表名」：MySQL 下第一段是 database，"
+                    "PostgreSQL 下第一段是 schema（默认 public）"
+                )}},
+                ["table"],
+            ),
         ),
         types.Tool(
             name="get_schema",
@@ -175,7 +181,9 @@ async def list_tools():
             name="search_data",
             description="在指定表的所有文本字段中模糊搜索关键词",
             inputSchema=schema(
-                {"table": {"type": "string"},
+                {"table": {"type": "string", "description": (
+                    "表名，可写成「库名.表名」；PostgreSQL 下第一段是 schema"
+                )},
                  "keyword": {"type": "string"},
                  "limit": {"type": "integer", "default": 20}},
                 ["table", "keyword"],
@@ -263,15 +271,18 @@ async def call_tool(name: str, arguments: dict):
     except ConfigError as e:
         log(False, error=str(e))
         return text(f"[无法定位数据源] {e}")
+    except DialectError as e:
+        log(False, error=str(e))
+        return text(f"[提示] {e}")
     except Exception as e:
         log(False, error=f"{type(e).__name__}: {e}")
         return text(f"[错误] {type(e).__name__}: {e}")
 
 
 def _query(ds, env, args):
-    conn = get_conn(ds)
+    d, conn = open_conn(ds)
     try:
-        cur = conn.cursor(dictionary=True)
+        cur = d.cursor(conn)
         cur.execute(args["sql"], args.get("params") or [])
         rows = cur.fetchall()
         cur.close()
@@ -281,125 +292,73 @@ def _query(ds, env, args):
 
 
 def _execute(ds, env, args):
-    conn = get_conn(ds)
+    d, conn = open_conn(ds)
     try:
         cur = conn.cursor()
         cur.execute(args["sql"], args.get("params") or [])
         conn.commit()
-        affected, last_id = cur.rowcount, cur.lastrowid
+        affected = cur.rowcount
+        last_id = d.insert_id(cur)
         cur.close()
+        id_part = f"，insertId: {last_id}" if last_id else ""
         return {
             "content": text(
-                f"影响行数: {affected}，insertId: {last_id}\n"
+                f"影响行数: {affected}{id_part}\n"
                 f"-- 来源：{source_label(ds, env)}"
             ),
-            "rows": affected,
+            "rows": affected if affected and affected > 0 else 0,
         }
     finally:
         conn.close()
 
 
 def _list_tables(ds, env, args):
-    if not ds.get("database"):
-        return {
-            "content": text(
-                "[提示] 该数据源未绑定具体库，SHOW TABLES 无法执行。\n"
-                "请用 query 指定 `库名.表名` 访问，或在数据源里设置一个默认库。"
-            ),
-            "rows": 0,
-        }
-    conn = get_conn(ds)
+    d, conn = open_conn(ds)
     try:
-        cur = conn.cursor()
-        cur.execute("SHOW TABLES")
-        tables = [r[0] for r in cur.fetchall()]
-        cur.close()
+        tables = d.list_tables(conn, ds)
         return {"content": payload(tables, ds, env), "rows": len(tables)}
     finally:
         conn.close()
 
 
 def _describe_table(ds, env, args):
-    table = str(args["table"]).replace("`", "")
-    conn = get_conn(ds)
+    d, conn = open_conn(ds)
     try:
-        cur = conn.cursor(dictionary=True)
-        # DESCRIBE 不支持 db.table 全限定名，用 SHOW COLUMNS FROM 代替
-        if "." in table:
-            schema, tbl = table.split(".", 1)
-            cur.execute(f"SHOW COLUMNS FROM `{schema}`.`{tbl}`")
-        else:
-            if not ds.get("database"):
-                cur.close()
-                return {
-                    "content": text(
-                        "[提示] 该数据源未绑定具体库，请用 `库名.表名` 指定表，"
-                        "或在数据源里设置一个默认库。"
-                    ),
-                    "rows": 0,
-                }
-            cur.execute(f"SHOW COLUMNS FROM `{table}`")
-        fields = cur.fetchall()
-        cur.close()
+        fields = d.columns(conn, ds, args["table"])
         return {"content": payload(fields, ds, env), "rows": len(fields)}
     finally:
         conn.close()
 
 
 def _get_schema(ds, env, args):
-    if not ds.get("database"):
-        return {
-            "content": text(
-                "[提示] 该数据源未绑定具体库，无法枚举全部表结构。\n"
-                "请用 describe_table 指定 `库名.表名`，或在数据源里设置一个默认库。"
-            ),
-            "rows": 0,
-        }
-    conn = get_conn(ds)
+    d, conn = open_conn(ds)
     try:
-        cur = conn.cursor()
-        cur.execute("SHOW TABLES")
-        tables = [r[0] for r in cur.fetchall()]
+        tables = d.list_tables(conn, ds)
         result = {}
         for t in tables:
-            cur2 = conn.cursor(dictionary=True)
-            cur2.execute(f"DESCRIBE `{t}`")
-            result[t] = cur2.fetchall()
-            cur2.close()
-        cur.close()
+            result[t] = d.columns(conn, ds, t)
         return {"content": payload(result, ds, env), "rows": len(result)}
     finally:
         conn.close()
 
 
 def _search_data(ds, env, args):
-    table = str(args["table"]).replace("`", "")
-    keyword = args["keyword"]
-    limit = int(args.get("limit", 20))
-    conn = get_conn(ds)
+    d, conn = open_conn(ds)
     try:
-        cur = conn.cursor(dictionary=True)
-        if "." in table:
-            schema, tbl = table.split(".", 1)
-            cur.execute(f"SHOW COLUMNS FROM `{schema}`.`{tbl}`")
-        else:
-            if not ds.get("database"):
-                cur.close()
-                return {"content": text(
-                    "[提示] 该数据源未绑定具体库，请用 `库名.表名` 指定表。"), "rows": 0}
-            cur.execute(f"SHOW COLUMNS FROM `{table}`")
-        cols = [f["Field"] for f in cur.fetchall()
-                if "char" in str(f["Type"]).lower() or "text" in str(f["Type"]).lower()]
+        table = args["table"]
+        keyword = args["keyword"]
+        limit = int(args.get("limit", 20))
+        cols = [
+            c["name"] for c in d.columns(conn, ds, table)
+            if "char" in str(c["type"]).lower() or "text" in str(c["type"]).lower()
+        ]
         if not cols:
-            cur.close()
-            return {"content": text(f"表 `{table}` 没有可搜索的文本字段"), "rows": 0}
-        where = " OR ".join(f"`{c}` LIKE %s" for c in cols)
-        cur.execute(
-            f"SELECT * FROM `{table}` WHERE {where} LIMIT {limit}"
-            if "." not in table else
-            f"SELECT * FROM {table} WHERE {where} LIMIT {limit}",
-            [f"%{keyword}%"] * len(cols),
-        )
+            return {"content": text(f"表「{table}」没有可搜索的文本字段"), "rows": 0}
+
+        where = " OR ".join(f"{d.quote(c)} {d.like_operator} %s" for c in cols)
+        sql = f"SELECT * FROM {d.ref(ds, table)} WHERE {where} LIMIT {limit}"
+        cur = d.cursor(conn)
+        cur.execute(sql, [f"%{keyword}%"] * len(cols))
         rows = cur.fetchall()
         cur.close()
         return {"content": payload(rows, ds, env), "rows": len(rows)}

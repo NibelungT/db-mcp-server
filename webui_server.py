@@ -25,6 +25,7 @@ from config_store import (
     new_id,
     resolve_password,
 )
+from db_dialect import default_port, get_dialect, supported_drivers
 
 CONFIG_PATH = os.environ.get("DB_MCP_CONFIG") or os.path.join(BASE_DIR, "config.json")
 WEBUI_DIR = os.path.join(BASE_DIR, "webui")
@@ -44,6 +45,7 @@ class DatasourceIn(BaseModel):
     user: str = ""
     password: str | None = None
     database: str = ""          # 允许为空：不绑定具体库，查询用 db.table
+    schema: str = ""            # 仅 PostgreSQL 使用，留空走 public
     readonly: bool = False
     description: str = ""
     version: int | None = None
@@ -84,11 +86,13 @@ class GlobalIn(BaseModel):
 
 class ProbeIn(BaseModel):
     datasource_id: str | None = None
+    driver: str | None = None
     host: str | None = None
-    port: int = 3306
+    port: int | None = None
     user: str | None = None
     password: str | None = None
     database: str | None = None
+    schema: str | None = None
 
 
 # ---------------------------------------------------------------- 工具函数
@@ -128,6 +132,12 @@ def get_config():
     return public_config()
 
 
+@app.get("/api/drivers")
+def get_drivers():
+    """支持驱动的单一来源，前端下拉直接渲染这份数据。"""
+    return supported_drivers()
+
+
 # -------------------------------------------------------------- 执行记录
 
 @app.get("/api/logs")
@@ -165,11 +175,12 @@ def clear_logs():
 def create_datasource(body: DatasourceIn):
     payload = body.model_dump()
     payload.pop("version", None)
+    params = {"charset": "utf8mb4"} if payload.get("driver") == "mysql" else {}
 
     def fn(cfg):
         cfg["datasources"].append({
             "id": new_id("ds"),
-            "params": {"charset": "utf8mb4"},
+            "params": params,
             **payload,
             "password": body.password or "",
         })
@@ -225,25 +236,18 @@ def delete_datasource(ds_id: str, version: int | None = None):
 @app.post("/api/datasources/{ds_id}/test")
 def test_datasource(ds_id: str):
     ds = find_ds(store.load(), ds_id)
-    return _try_connect(
-        ds["host"], ds.get("port", 3306), ds.get("user", ""),
-        resolve_password(ds.get("password", "")), ds.get("database") or None,
-    )
+    return _try_connect(ds)
 
 
-def _try_connect(host, port, user, password, database=None):
+def _try_connect(ds):
     start = time.time()
     try:
-        import mysql.connector
-
-        kwargs = dict(host=host, port=int(port), user=user,
-                      password=password, connection_timeout=6)
-        if database:
-            kwargs["database"] = database
-        conn = mysql.connector.connect(**kwargs)
+        d = get_dialect(ds.get("driver"))
+        conn = d.connect({**ds, "password": resolve_password(ds.get("password") or "")})
         cur = conn.cursor()
         cur.execute("SELECT 1")
         cur.fetchone()
+        cur.close()
         conn.close()
         return {"ok": True, "ms": int((time.time() - start) * 1000)}
     except Exception as e:
@@ -256,33 +260,40 @@ def _try_connect(host, port, user, password, database=None):
 
 @app.post("/api/probe")
 def probe_databases(body: ProbeIn):
-    """连库并列出可访问的数据库，避免手填库名出错。
+    """连库并列出可访问的数据库 / schema，避免手填库名出错。
 
-    传 datasource_id 时用已保存的密码（编辑态前端只有掩码，拿不到明文）。
+    传 datasource_id 时用已保存的密码（编辑态前端只有掩码，拿不到明文）；
+    其余字段以请求体为准，这样用户改了端口或驱动再点「加载」也能生效。
     """
     start = time.time()
     try:
-        import mysql.connector
+        saved = find_ds(store.load(), body.datasource_id) if body.datasource_id else {}
+        driver = body.driver or saved.get("driver") or "mysql"
+        ds = {
+            "driver": driver,
+            "host": body.host or saved.get("host"),
+            "port": int(body.port or saved.get("port") or default_port(driver)),
+            "user": body.user if body.user is not None else saved.get("user", ""),
+            "password": body.password or saved.get("password", ""),
+            "database": body.database if body.database is not None else saved.get("database", ""),
+            "schema": body.schema if body.schema is not None else saved.get("schema", ""),
+        }
+        if not ds["host"]:
+            raise ConfigError("请先填主机地址")
 
-        if body.datasource_id:
-            ds = find_ds(store.load(), body.datasource_id)
-            host, port = ds["host"], ds.get("port", 3306)
-            user = ds.get("user", "")
-            pwd = resolve_password(ds.get("password", ""))
-        else:
-            host, port = body.host, int(body.port)
-            user = body.user or ""
-            pwd = resolve_password(body.password or "")
-
-        conn = mysql.connector.connect(
-            host=host, port=port, user=user, password=pwd, connection_timeout=6,
-        )
-        cur = conn.cursor()
-        cur.execute("SHOW DATABASES")
-        skip = {"information_schema", "mysql", "performance_schema", "sys"}
-        dbs = sorted(r[0] for r in cur.fetchall() if r[0] not in skip)
-        conn.close()
-        return {"ok": True, "databases": dbs, "ms": int((time.time() - start) * 1000)}
+        d = get_dialect(driver)
+        conn = d.connect({**ds, "password": resolve_password(ds["password"] or "")})
+        try:
+            dbs = d.databases(conn)
+            schemas = d.schemas(conn)
+        finally:
+            conn.close()
+        return {
+            "ok": True,
+            "databases": dbs,
+            "schemas": schemas,
+            "ms": int((time.time() - start) * 1000),
+        }
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]}
 

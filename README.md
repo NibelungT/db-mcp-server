@@ -1,6 +1,6 @@
 # db-mcp-server
 
-给 AI 用的多数据源 MySQL 查询服务，带一个网页配置中心。
+给 AI 用的多数据源查询服务，支持 MySQL 与 PostgreSQL，带一个网页配置中心。
 
 解决的问题很具体：**同一个服务在不同环境（开发 / 测试 / 预发 / 生产）连着不同的库**。AI 只有一张 `execute_sql(sql)` 的手牌时，很容易查了测试库却让用户以为在看生产数据。这个项目让 AI 说"查订单服务的测试库"，而不是让它猜一个连接串。
 
@@ -19,11 +19,12 @@ AI 调用 query(sql="...", project="订单服务", env="test")
 | | |
 |---|---|
 | **按项目路由** | 项目名或别名（`订单服务` / `order` / `订单`）都能命中，一个项目在每个环境绑一个数据源 |
+| **MySQL + PostgreSQL** | 差异收敛在 `db_dialect.py`，列信息、表列表、引用方式对外一致 |
 | **显式指定必须命中** | 说了 `env=prod` 但没绑生产库，直接报错并列出已绑定的环境，**不会降级**到别的库返回数据 |
 | **只读保护** | 标记为只读的数据源（通常是生产），`execute` 在服务端被拒绝，不依赖 AI 自觉 |
 | **配置热加载** | 配置中心改完数据源，MCP 下次调用就生效，不用重启客户端 |
 | **执行记录** | 每次查询落 `query_log.jsonl`，界面可分页查看：时间、来源、SQL、耗时、成功/失败、失败原因 |
-| **无库模式** | `database` 可以留空，用 `库名.表名` 跨库查询 |
+| **无库模式** | MySQL 下 `database` 可留空，用 `库名.表名` 跨库查询 |
 | **单文件前端** | 零构建、零框架，改样式只需编辑 `webui/index.html` |
 
 ## 界面
@@ -43,7 +44,7 @@ AI 调用 query(sql="...", project="订单服务", env="test")
 python -m pip install -r requirements.txt
 ```
 
-需要 Python 3.10+（用到了 `str | None` 类型标注）。依赖：`mcp`、`mysql-connector-python`、`python-dotenv`、`fastapi`、`uvicorn`。
+需要 Python 3.10+（用到了 `str | None` 类型标注）。依赖：`mcp`、`mysql-connector-python`、`psycopg[binary]`、`python-dotenv`、`fastapi`、`uvicorn`。
 
 ### 2. 启动配置中心
 
@@ -186,7 +187,21 @@ python db_mcp_server.py describe-table --datasource order-test --table db.tbl
       "user": "readonly_user",
       "password": "${ORDER_TEST_PASSWORD}",
       "database": "",
+      "schema": "",
       "readonly": false
+    },
+    {
+      "id": "ds_report_dev",
+      "alias": "report-dev",
+      "env": "dev",
+      "driver": "postgres",
+      "host": "10.0.0.9",
+      "port": 5432,
+      "user": "report_ro",
+      "password": "${REPORT_PASSWORD}",
+      "database": "analytics",
+      "schema": "biz",
+      "readonly": true
     }
   ],
   "projects": [
@@ -217,18 +232,58 @@ python db_mcp_server.py describe-table --datasource order-test --table db.tbl
 | `DB_MCP_CONFIG` | 指向另一个配置文件，测试时用，避免污染真实配置 |
 | `DB_MCP_LOG` | 指向另一个执行记录文件 |
 
+## PostgreSQL 支持
+
+`driver` 填 `postgres`（`postgresql` / `pg` 也认），端口自动用 5432。语义上和 MySQL 有一处关键差别：
+
+**MySQL 的「库」是 database，PG 的是 schema。**
+
+| | MySQL | PostgreSQL |
+|---|---|---|
+| 连接绑定 | 一个 database | 一个 database |
+| `库名.表名` 的第一段 | database | **schema** |
+| 跨库查询 | 支持（`a.t` 与 `b.t` 同语句） | **不支持**，只能跨 schema |
+| 默认命名空间 | 所连的 database | `public`，或用 `schema` 字段指定 |
+| 文本搜索 | `LIKE`（默认不区分大小写） | `ILIKE`（显式不区分大小写） |
+
+所以给 PG 配数据源时，`database` 必填（PG 强制要求），`schema` 可选：
+
+```json
+{
+  "driver": "postgres",
+  "host": "10.0.0.9",
+  "port": 5432,
+  "database": "analytics",
+  "schema": "biz"
+}
+```
+
+配了 `schema` 之后，`list_tables` / `get_schema` 只枚举该 schema；`describe_table` 仍可用 `其他schema.表名` 显式覆盖。
+
+列信息做了统一：MySQL 的 `Field/Type/Null/Key` 和 PG 的 `information_schema` 都归一成 `name/type/nullable/key/default/extra`，主键统一标 `PRI`。所以 AI 在两个库之间切换时看到的字段结构长得一样。
+
+结果里的来源标注会带上 schema，一眼能看出查的是哪个命名空间：
+
+```
+-- 来源：report-dev · 开发 · analytics/biz
+```
+
 ## 目录结构
 
 ```
 config_store.py     配置层：原子写、mtime 热加载、密码解析、解析器、乐观锁
+db_dialect.py       方言层：MySQL / PostgreSQL 的连接、引用、元数据查询
 db_mcp_server.py    MCP 服务（stdio）+ CLI，8 个工具
-webui_server.py     FastAPI 后端，17 个路由
+webui_server.py     FastAPI 后端，18 个路由
 query_log.py        执行记录：JSONL 追加、5MB 轮转、分页、统计
 migrate_env.py      .env → config.json，幂等
 webui/index.html    配置界面，单文件零构建
 ```
 
-**一条硬约束**：`config_store.py` 的 `resolve()` 是 MCP 服务和 Web 界面共用的唯一解析入口。两边各写一套的话，会出现"界面显示默认是测试库、AI 实际查了生产库"这种无法排查的问题。
+**两条硬约束**：
+
+- `config_store.py` 的 `resolve()` 是 MCP 服务和 Web 界面共用的唯一解析入口。两边各写一套的话，会出现"界面显示默认是测试库、AI 实际查了生产库"这种无法排查的问题。
+- 所有数据库差异只准出现在 `db_dialect.py`。业务代码里出现第二处 `if driver == ...`，就说明方言层漏了东西。
 
 ## 安全
 
@@ -241,9 +296,11 @@ webui/index.html    配置界面，单文件零构建
 
 | 限制 | 说明 |
 |---|---|
-| 只支持 MySQL | `driver` 字段已预留，接 PostgreSQL 需要给 `list_tables` / `describe_table` 按方言分支 |
+| 只支持 MySQL / PostgreSQL | 接第三种库只需在 `db_dialect.py` 加一个子类，业务代码不用动 |
+| PostgreSQL 不支持跨 database | 只能跨 schema；要查另一个库得单独配一个数据源 |
+| PG 的 `list_tables` 按 schema 枚举 | 配了 `schema` 就只看这个 schema，不会列出全库所有 schema 的表 |
 | 无登录鉴权 | 靠回环地址隔离 |
-| `list_tables` / `get_schema` 在无库数据源上不可用 | `SHOW TABLES` 必须有当前库，会给出提示改用 `库名.表名` |
+| `list_tables` / `get_schema` 在 MySQL 无库数据源上不可用 | `SHOW TABLES` 必须有当前库，会给出提示改用 `库名.表名` |
 | `get_schema` 不缓存 | 表多的库较慢，优先用 `describe_table` |
 | 一个项目每环境只能绑一个数据源 | 需要"一个环境查两个库"时用无库数据源 + 全限定名 |
 

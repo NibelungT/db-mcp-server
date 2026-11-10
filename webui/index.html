@@ -1037,7 +1037,9 @@ setInterval(() => {
 function dsRowHTML(d) {
   const st = statusOf(d.id);
   const drv = d.driver && d.driver !== 'mysql' ? `<span class="badge drv">${esc(d.driver)}</span>` : '';
-  const sub = `${d.host}:${d.port} · ${d.database || '不限定库'}`;
+  const dbPart = d.database || (d.driver === 'postgres' ? '默认库' : '不限定库');
+  const schemaPart = d.schema ? ` / ${d.schema}` : '';
+  const sub = `${d.host}:${d.port} · ${dbPart}${schemaPart}`;
   const title = (d.user ? `${d.user}@` : '') + sub;
   const isDef = !!(CFG.global && CFG.global.defaultDatasource === d.id);
   return `
@@ -1166,13 +1168,18 @@ function openDsModal(id) {
   const cur = CFG.environments.find(e => e.key === CURRENT_ENV) || {};
   const d = isEdit ? dsById(id) : {
     alias: '', env: CURRENT_ENV, driver: 'mysql', host: '', port: 3306,
-    user: '', password: '', database: '', readonly: !!cur.readonlyHint
+    user: '', password: '', database: '', schema: '', readonly: !!cur.readonlyHint
   };
   if (!d) return;
 
   const envOpts = sortedEnvs().map(e =>
     `<option value="${e.key}" ${e.key === d.env ? 'selected' : ''}>${esc(e.label)}（${e.key}）</option>`
   ).join('');
+
+  const driver = d.driver || 'mysql';
+  const drvOpts = [['mysql', 'MySQL'], ['postgres', 'PostgreSQL']]
+    .map(([v, label]) => `<option value="${v}" ${v === driver ? 'selected' : ''}>${label}</option>`)
+    .join('');
 
   showModal(`
     <div class="modal-head">
@@ -1192,11 +1199,9 @@ function openDsModal(id) {
       </div>
 
       <div class="field-row">
-        <div class="field" style="flex:0 0 108px">
+        <div class="field" style="flex:0 0 128px">
           <label class="label">驱动</label>
-          <select id="f-driver">
-            <option value="mysql" selected>MySQL</option>
-          </select>
+          <select id="f-driver" onchange="onDriverChange()">${drvOpts}</select>
         </div>
         <div class="field" style="flex:1">
           <label class="label">主机</label>
@@ -1226,7 +1231,13 @@ function openDsModal(id) {
         </div>
         <input type="text" id="f-database" class="mono" list="db-list" value="${esc(d.database)}" placeholder="留空 = 不限定库" style="margin-top:8px">
         <datalist id="db-list"></datalist>
-        <div class="hint" id="db-hint">留空则不绑定具体库，查询时用 <code class="mono">库名.表名</code> 跨库访问</div>
+        <div class="hint" id="db-hint"></div>
+      </div>
+
+      <div class="field" id="f-schema-wrap" style="display:none">
+        <label class="label">Schema <span class="opt">仅 PostgreSQL，留空用 public</span></label>
+        <input type="text" id="f-schema" class="mono" list="schema-list" value="${esc(d.schema || '')}" placeholder="public">
+        <datalist id="schema-list"></datalist>
       </div>
 
       <div class="field">
@@ -1241,6 +1252,36 @@ function openDsModal(id) {
       <button class="btn primary" onclick="saveDs('${isEdit ? d.id : ''}')">保存</button>
     </div>
   `);
+
+  syncDriverUI();
+}
+
+const DRIVER_PORTS = { mysql: 3306, postgres: 5432 };
+
+/* 切换驱动时只调端口和提示，不动用户已填的其他字段 */
+function onDriverChange() {
+  const drv = $('f-driver').value;
+  const port = $('f-port');
+  if (port) {
+    const isDefault = Object.values(DRIVER_PORTS).some(v => String(v) === port.value.trim());
+    if (isDefault || !port.value.trim()) port.value = DRIVER_PORTS[drv] || '';
+  }
+  syncDriverUI();
+}
+
+function syncDriverUI() {
+  const drvEl = $('f-driver');
+  if (!drvEl) return;
+  const drv = drvEl.value;
+  const wrap = $('f-schema-wrap');
+  if (wrap) wrap.style.display = drv === 'postgres' ? '' : 'none';
+
+  const hint = $('db-hint');
+  if (hint) {
+    hint.innerHTML = drv === 'postgres'
+      ? 'PG 连接绑定的是 database，「库.表」的第一段按 <code class="mono">schema</code> 解释；跨 database 查询不支持'
+      : '留空则不绑定具体库，查询时用 <code class="mono">库名.表名</code> 跨库访问';
+  }
 }
 
 function syncReadonly() {
@@ -1252,12 +1293,18 @@ function syncReadonly() {
 async function loadDatabases(dsId) {
   const hint = $('db-hint');
   hint.textContent = '正在连接…';
-  const body = dsId ? { datasource_id: dsId } : {
+  const driver = $('f-driver').value;
+  const body = {
+    driver,
     host: $('f-host').value.trim(),
-    port: parseInt($('f-port').value, 10) || 3306,
+    port: parseInt($('f-port').value, 10) || DRIVER_PORTS[driver] || null,
     user: $('f-user').value.trim(),
-    password: $('f-password').value
+    password: $('f-password').value,
+    database: $('f-database').value.trim(),
+    schema: $('f-schema') ? $('f-schema').value.trim() : ''
   };
+  if (dsId) body.datasource_id = dsId;
+
   try {
     const r = await api('POST', '/api/probe', body);
     if (!r.ok) {
@@ -1265,7 +1312,12 @@ async function loadDatabases(dsId) {
       return;
     }
     $('db-list').innerHTML = r.databases.map(n => `<option value="${esc(n)}"></option>`).join('');
-    hint.textContent = `找到 ${r.databases.length} 个库 · ${r.ms}ms，点击输入框选择`;
+    const schemaList = $('schema-list');
+    if (schemaList && r.schemas && r.schemas.length) {
+      schemaList.innerHTML = r.schemas.map(n => `<option value="${esc(n)}"></option>`).join('');
+    }
+    const extra = (r.schemas && r.schemas.length) ? ` · ${r.schemas.length} 个 schema` : '';
+    hint.textContent = `找到 ${r.databases.length} 个库${extra} · ${r.ms}ms，点击输入框选择`;
     $('f-database').focus();
   } catch (e) {
     hint.textContent = e.message;
@@ -1279,15 +1331,17 @@ async function saveDs(id) {
   if (!alias) return toast('别名不能为空', false);
   if (!host) return toast('主机不能为空', false);
 
+  const driver = $('f-driver').value;
   const pwd = $('f-password').value;
   const body = {
     alias,
     env: $('f-env').value,
-    driver: 'mysql',
+    driver,
     host,
-    port: parseInt($('f-port').value, 10) || 3306,
+    port: parseInt($('f-port').value, 10) || DRIVER_PORTS[driver] || 3306,
     user: $('f-user').value.trim(),
     database,
+    schema: $('f-schema') ? $('f-schema').value.trim() : '',
     readonly: $('f-readonly').checked
   };
   if (!id || pwd) body.password = pwd;

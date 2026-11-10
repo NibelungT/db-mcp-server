@@ -10,6 +10,8 @@ import re
 import threading
 import time
 
+from db_dialect import default_port, is_supported, normalize_driver, supported_drivers
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 便于测试或部署到其他位置：DB_MCP_CONFIG 指向别的配置文件
 DEFAULT_PATH = os.environ.get("DB_MCP_CONFIG") or os.path.join(BASE_DIR, "config.json")
@@ -150,8 +152,9 @@ class ConfigStore:
         d["global"].setdefault("defaultEnv", None)
         d["global"].setdefault("defaultDatasource", None)
         for ds in d["datasources"]:
-            ds.setdefault("driver", "mysql")
-            ds.setdefault("port", 3306)
+            ds["driver"] = normalize_driver(ds.get("driver"))
+            ds.setdefault("port", default_port(ds["driver"]))
+            ds.setdefault("schema", "")
             ds.setdefault("readonly", False)
             ds.setdefault("params", {})
             ds.setdefault("description", "")
@@ -185,8 +188,11 @@ class ConfigStore:
             alias_seen[a] = ds["id"]
             if ds.get("env") not in env_keys:
                 raise ConfigError(f"数据源「{a}」的环境「{ds.get('env')}」不存在")
-            if ds.get("driver") != "mysql":
-                raise ConfigError(f"数据源「{a}」暂只支持 mysql")
+            if not is_supported(ds.get("driver")):
+                names = "、".join(d["value"] for d in supported_drivers())
+                raise ConfigError(
+                    f"数据源「{a}」的驱动「{ds.get('driver')}」不支持，可选：{names}"
+                )
             if not ds.get("host"):
                 raise ConfigError(f"数据源「{a}」缺少主机地址")
             # database 允许为空：此时连接不绑定具体库，查询需用 db.table 全限定名
@@ -372,6 +378,7 @@ class ConfigStore:
                 "host": ds.get("host"),
                 "port": ds.get("port"),
                 "database": ds.get("database"),
+                "schema": ds.get("schema") or None,
                 "readonly": bool(ds.get("readonly")),
             }
             for ds in data["datasources"]

@@ -38,6 +38,21 @@
       "params": { "charset": "utf8mb4" },
       "readonly": true,
       "description": "生产库通常设为只读，execute 会被拒绝"
+    },
+    {
+      "id": "ds_example_report_dev",
+      "alias": "report-dev",
+      "env": "dev",
+      "driver": "postgres",
+      "host": "10.0.0.9",
+      "port": 5432,
+      "user": "report_ro",
+      "password": "${REPORT_PASSWORD}",
+      "database": "analytics",
+      "schema": "biz",
+      "params": {},
+      "readonly": true,
+      "description": "PostgreSQL：database 是库，schema 是命名空间，留空走 public"
     }
   ],
   "projects": [
